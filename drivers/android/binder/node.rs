@@ -124,6 +124,13 @@ impl DeliveryState {
         self.has_pushed_wrapper = true;
         self.has_strong_zero2one = true;
     }
+
+    /// The `Node` was delivered or dropped, and the wrapper is not scheduled.
+    fn node_done(&mut self) {
+        self.has_pushed_node = false;
+        self.has_weak_zero2one = false;
+        self.has_strong_zero2one = false;
+    }
 }
 
 struct CountState {
@@ -178,6 +185,8 @@ struct NodeInner {
     active_inc_refs: u8,
     /// List of `NodeRefInfo` objects that reference this node.
     refs: List<NodeRefInfo, { NodeRefInfo::LIST_NODE }>,
+    /// Set when `do_work_locked` removes the node from the owner's `nodes` tree.
+    is_deleted: bool,
 }
 
 use kernel::bindings::rb_node_layout;
@@ -238,6 +247,7 @@ impl Node {
                     has_oneway_transaction: false,
                     active_inc_refs: 0,
                     refs: List::new(),
+                    is_deleted: false,
                 },
             ),
             debug_id: super::next_debug_id(),
@@ -636,6 +646,7 @@ impl Node {
         }
         if no_active_inc_refs && !weak {
             // Remove the node if there are no references to it.
+            inner.is_deleted = true;
             guard.remove_node(self.ptr);
         }
         drop(guard);
@@ -727,9 +738,13 @@ impl DeliverToRead for Node {
             return Ok(true);
         }
 
-        inner.delivery_state.has_pushed_node = false;
-        inner.delivery_state.has_weak_zero2one = false;
-        inner.delivery_state.has_strong_zero2one = false;
+        inner.delivery_state.node_done();
+
+        if inner.is_deleted {
+            // Nothing is pending for a deleted node, and userspace may already have reused its
+            // address for a new node, so leave the tree alone.
+            return Ok(true);
+        }
 
         self.do_work_locked(writer, owner_inner)
     }
@@ -740,6 +755,13 @@ impl DeliverToRead for Node {
 
         // We only do something on BINDER_THREAD_EXIT, not process exit.
         if owner_inner.is_dead {
+            return;
+        }
+
+        let inner = self.inner.access_mut(&mut owner_inner);
+        if inner.is_deleted {
+            // A deleted node has nothing to deliver, so don't requeue it.
+            inner.delivery_state.node_done();
             return;
         }
 
